@@ -1,6 +1,9 @@
 
+
 import streamlit as st
 import requests
+import re
+from html.parser import HTMLParser
 import pandas as pd
 import numpy as np
 from collections import Counter
@@ -17,7 +20,12 @@ st.set_page_config(
     layout="wide"
 )
 
-API_URL = "https://xosoapi.online/api/v1/vietnam/draws"
+FREE_DATA_URLS = {
+    30: "https://ketqua.vn/so-ket-qua-30-ngay",
+    60: "https://ketqua.vn/so-ket-qua-60-ngay",
+    90: "https://ketqua.vn/so-ket-qua-90-ngay",
+    100: "https://ketqua.vn/so-ket-qua-100-ngay",
+}
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 # ============================================================
@@ -27,142 +35,188 @@ VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 st.title("📈 HỆ THỐNG PHÂN TÍCH & DỰ ĐOÁN XỔ SỐ TỰ ĐỘNG (XSMB)")
 
 st.caption(
-    "Tự động lấy dữ liệu XSMB từ API, phân tích tần suất và tạo danh sách "
-    "tham khảo dựa trên dữ liệu lịch sử."
+    "Tự động lấy dữ liệu XSMB từ nguồn web công khai, phân tích tần suất "
+    "và tạo danh sách tham khảo dựa trên dữ liệu lịch sử."
 )
 
 # ============================================================
-# LẤY API KEY
+# LẤY DỮ LIỆU MIỄN PHÍ - KHÔNG CẦN API KEY
 # ============================================================
 
-def get_api_key():
-    try:
-        key = st.secrets.get("XOSO_API_KEY", "")
-    except Exception:
-        key = ""
+class VisibleTextParser(HTMLParser):
+    """Chuyển HTML thành phần văn bản nhìn thấy để phân tích."""
 
-    if not key:
-        return ""
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip_depth = 0
 
-    return str(key).strip()
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in {"script", "style", "noscript", "svg"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag.lower() in {"script", "style", "noscript", "svg"} and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data):
+        if not self.skip_depth:
+            text = data.strip()
+            if text:
+                self.parts.append(text)
 
 
-# ============================================================
-# GỌI API
-# ============================================================
+def html_to_text(html_text):
+    parser = VisibleTextParser()
+    parser.feed(html_text)
+    return re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
+
+
+def choose_source_url(history_days):
+    """Chọn trang miễn phí có phạm vi gần nhất nhưng không nhỏ hơn nhu cầu."""
+    for days in (30, 60, 90, 100):
+        if history_days <= days:
+            return FREE_DATA_URLS[days], days
+    return FREE_DATA_URLS[100], 100
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_xsmb_data(limit=100):
+    """
+    Lấy XSMB từ trang kết quả công khai, không cần API Key.
 
-    api_key = get_api_key()
+    Hàm trả về cấu trúc tương thích với parser cũ:
+    [{"date": "YYYY-MM-DD", "draws": [{"results": [...]}]}]
+    """
 
-    if not api_key:
-        return {
-            "success": False,
-            "error": "Chưa cấu hình XOSO_API_KEY trong Streamlit Secrets.",
-            "data": []
-        }
+    source_url, source_days = choose_source_url(limit)
 
     headers = {
-        "X-API-Key": api_key,
-        "Content-Type": "application/json"
-    }
-
-    params = {
-        "region": "MB",
-        "limit": limit
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        ),
+        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
     }
 
     try:
         response = requests.get(
-            API_URL,
+            source_url,
             headers=headers,
-            params=params,
-            timeout=20
+            timeout=25
         )
-
-        if response.status_code == 401:
-            return {
-                "success": False,
-                "error": "API Key không hợp lệ hoặc đã hết hiệu lực.",
-                "data": []
-            }
-
-        if response.status_code == 403:
-            return {
-                "success": False,
-                "error": "API Key không có quyền truy cập dữ liệu này.",
-                "data": []
-            }
-
-        if response.status_code == 429:
-            return {
-                "success": False,
-                "error": "API đang giới hạn số lần gọi. Vui lòng thử lại sau.",
-                "data": []
-            }
-
-        if response.status_code >= 500:
-            return {
-                "success": False,
-                "error": "Máy chủ API đang gặp sự cố. Vui lòng thử lại sau.",
-                "data": []
-            }
-
         response.raise_for_status()
 
-        payload = response.json()
+        text = html_to_text(response.text)
 
-        if not isinstance(payload, dict):
+        # Các trang có thể lặp tên XSMB trong tiêu đề/breadcrumb.
+        # Chỉ giữ những mốc ngày mà phần sau thực sự chứa giải ĐB.
+        date_matches = list(
+            re.finditer(
+                r"XSMB.*?(\d{2}/\d{2}/\d{4})",
+                text,
+                flags=re.IGNORECASE
+            )
+        )
+
+        records = []
+        seen_dates = set()
+
+        for index, match in enumerate(date_matches):
+            date_text = match.group(1)
+
+            try:
+                date_obj = datetime.strptime(date_text, "%d/%m/%Y")
+                iso_date = date_obj.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+            # Bỏ các đoạn không phải bảng kết quả.
+            next_pos = (
+                date_matches[index + 1].start()
+                if index + 1 < len(date_matches)
+                else len(text)
+            )
+            block = text[match.end():next_pos]
+
+            db_pos = block.find("ĐB")
+            if db_pos < 0:
+                continue
+
+            result_block = block[db_pos:]
+
+            # Chỉ lấy phần kết quả giải thưởng, không lấy thống kê phía dưới.
+            stop_positions = [
+                pos for marker in ("Bảng loto", "Đầu", "Thống kê")
+                for pos in [result_block.find(marker)]
+                if pos > 0
+            ]
+            if stop_positions:
+                result_block = result_block[:min(stop_positions)]
+
+            numbers = re.findall(r"(?<!\d)\d{2,5}(?!\d)", result_block)
+
+            # Một ngày XSMB có 27 giải thưởng/giá trị số. Cho phép sai lệch
+            # nhỏ vì từng trang có thể trình bày khác nhau.
+            if len(numbers) < 20:
+                continue
+
+            if iso_date in seen_dates:
+                continue
+
+            seen_dates.add(iso_date)
+            records.append({
+                "date": iso_date,
+                "draws": [{"results": numbers}]
+            })
+
+            if len(records) >= source_days:
+                break
+
+        records.sort(
+            key=lambda x: x["date"],
+            reverse=True
+        )
+
+        if not records:
             return {
                 "success": False,
-                "error": "API trả về dữ liệu không đúng định dạng.",
+                "error": "Không đọc được dữ liệu XSMB từ nguồn miễn phí.",
                 "data": []
             }
-
-        data = payload.get("data", [])
-
-        if not isinstance(data, list):
-            data = []
 
         return {
             "success": True,
             "error": "",
-            "data": data
+            "data": records[:limit],
+            "source_url": source_url,
         }
 
     except requests.exceptions.Timeout:
         return {
             "success": False,
-            "error": "Kết nối API quá thời gian chờ.",
+            "error": "Nguồn dữ liệu miễn phí phản hồi quá chậm.",
             "data": []
         }
 
     except requests.exceptions.ConnectionError:
         return {
             "success": False,
-            "error": "Không thể kết nối tới máy chủ API.",
+            "error": "Không thể kết nối tới nguồn dữ liệu XSMB miễn phí.",
             "data": []
         }
 
     except requests.exceptions.RequestException as e:
         return {
             "success": False,
-            "error": f"Lỗi kết nối API: {str(e)}",
-            "data": []
-        }
-
-    except ValueError:
-        return {
-            "success": False,
-            "error": "API không trả về JSON hợp lệ.",
+            "error": f"Lỗi khi lấy dữ liệu XSMB: {str(e)}",
             "data": []
         }
 
     except Exception as e:
         return {
             "success": False,
-            "error": f"Lỗi không xác định: {str(e)}",
+            "error": f"Lỗi xử lý dữ liệu XSMB: {str(e)}",
             "data": []
         }
 
@@ -593,7 +647,7 @@ with st.sidebar:
     st.divider()
 
     if st.button(
-        "🔄 Làm mới dữ liệu API",
+        "🔄 Làm mới dữ liệu",
         use_container_width=True
     ):
         st.cache_data.clear()
@@ -601,48 +655,32 @@ with st.sidebar:
 
 
 # ============================================================
-# KIỂM TRA API
+# LẤY DỮ LIỆU
 # ============================================================
 
-api_key = get_api_key()
+with st.spinner("🔄 Đang lấy dữ liệu XSMB miễn phí..."):
 
-if not api_key:
+    data_result = get_xsmb_data(
+        limit=history_days
+    )
+
+
+if not data_result["success"]:
 
     st.error(
-        "🔐 Chưa có API Key."
+        f"❌ {data_result['error']}"
     )
 
     st.info(
-        "Sau khi đưa app lên Streamlit, hãy cấu hình "
-        "XOSO_API_KEY trong mục Secrets."
-    )
-
-    st.stop()
-
-
-with st.spinner("🔄 Đang lấy dữ liệu XSMB từ API..."):
-
-    api_result = get_xsmb_data(
-        limit=max(history_days, 60)
-    )
-
-
-if not api_result["success"]:
-
-    st.error(
-        f"❌ {api_result['error']}"
-    )
-
-    st.warning(
-        "Ứng dụng không sử dụng số giả hoặc dữ liệu thay thế "
-        "khi API gặp lỗi."
+        "Ứng dụng đang dùng nguồn dữ liệu XSMB công khai, không cần API Key. "
+        "Nếu nguồn tạm thời không phản hồi, hãy thử nút Làm mới dữ liệu."
     )
 
     st.stop()
 
 
 records = parse_api_data(
-    api_result["data"]
+    data_result["data"]
 )
 
 history = build_history(records)
@@ -651,7 +689,7 @@ history = build_history(records)
 if not history:
 
     st.error(
-        "API đã phản hồi nhưng không tìm thấy dữ liệu XSMB "
+        "Nguồn dữ liệu đã phản hồi nhưng không tìm thấy dữ liệu XSMB "
         "đúng định dạng để phân tích."
     )
 
@@ -668,7 +706,7 @@ history = history[:history_days]
 latest_date = history[0]["date"]
 
 st.success(
-    f"✅ API hoạt động bình thường — dữ liệu mới nhất: {latest_date}"
+    f"✅ Đã tải dữ liệu XSMB miễn phí — dữ liệu mới nhất: {latest_date}"
 )
 
 
@@ -972,6 +1010,6 @@ st.download_button(
 st.divider()
 
 st.caption(
-    "Hệ thống phân tích XSMB — dữ liệu được lấy từ API bên ngoài. "
+    "Hệ thống phân tích XSMB — dữ liệu được lấy từ nguồn web công khai. "
     "Kết quả thống kê chỉ mang tính tham khảo."
 )
