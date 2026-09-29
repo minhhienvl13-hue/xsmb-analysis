@@ -1,5 +1,6 @@
 
 
+
 import streamlit as st
 import requests
 import re
@@ -549,16 +550,37 @@ def predict_numbers(history, top_n=10):
 
 
 # ============================================================
-# BACKTEST WALK-FORWARD
+# BACKTEST WALK-FORWARD + TÍNH LÃI/LỖ
 # ============================================================
 
-def backtest(history, test_days=30, top_n=5):
+def backtest(
+    history,
+    test_days=30,
+    top_n=5,
+    cost_per_point=23000,
+    payout_per_hit=80000
+):
+    """
+    Backtest walk-forward cho top_n số.
+
+    Quan trọng:
+    - "Số lượng trúng" = số dự đoán khác nhau có xuất hiện ít nhất 1 lần.
+    - "Tổng nháy" = tổng số lần các số dự đoán thực sự xuất hiện trong
+      toàn bộ bảng loto của ngày đó. Một số xuất hiện 2 hoặc 3 lần được
+      tính 2 hoặc 3 nháy.
+    """
 
     if len(history) < 45:
         return {
             "tested_days": 0,
             "hits": 0,
             "hit_rate": 0,
+            "total_bets": 0,
+            "total_stake": 0,
+            "total_nhay": 0,
+            "total_payout": 0,
+            "profit_loss": 0,
+            "roi": 0,
             "details": []
         }
 
@@ -576,7 +598,7 @@ def backtest(history, test_days=30, top_n=5):
 
         train = chronological[:i]
 
-        # Chuyển lại về mới nhất trước
+        # Chuyển lại về mới nhất trước khi chấm điểm
         train = list(reversed(train))
 
         predictions = predict_numbers(
@@ -584,20 +606,36 @@ def backtest(history, test_days=30, top_n=5):
             top_n=top_n
         )
 
-        actual = set(
-            chronological[i]["loto"]
-        )
+        # Giữ nguyên toàn bộ loto của ngày thực tế, KHÔNG dùng set,
+        # để có thể đếm đúng số lần xuất hiện (nháy).
+        actual_loto = chronological[i]["loto"]
+        actual_counter = Counter(actual_loto)
 
         hits = [
             num for num in predictions
-            if num in actual
+            if actual_counter.get(num, 0) > 0
         ]
+
+        nhay_by_number = {
+            num: actual_counter.get(num, 0)
+            for num in predictions
+            if actual_counter.get(num, 0) > 0
+        }
+
+        total_nhay_day = sum(nhay_by_number.values())
+        stake_day = len(predictions) * cost_per_point
+        payout_day = total_nhay_day * payout_per_hit
+        profit_day = payout_day - stake_day
 
         details.append({
             "Ngày": chronological[i]["date"],
             "Dự đoán": ", ".join(predictions),
             "Kết quả trúng": ", ".join(hits),
-            "Số lượng trúng": len(hits)
+            "Số lượng trúng": len(hits),
+            "Nháy": total_nhay_day,
+            "Tiền cược": stake_day,
+            "Tiền trả": payout_day,
+            "Lãi/Lỗ": profit_day
         })
 
     tested_days = len(details)
@@ -606,9 +644,27 @@ def backtest(history, test_days=30, top_n=5):
         if x["Số lượng trúng"] > 0
     )
 
+    # Mỗi ngày thực tế đánh đúng top_n số; nếu mô hình không trả đủ số
+    # thì tính theo số dự đoán thực tế trong từng dòng.
+    total_bets = sum(
+        len([x for x in row["Dự đoán"].split(", ") if x])
+        for row in details
+    )
+
+    total_stake = total_bets * cost_per_point
+    total_nhay = sum(row["Nháy"] for row in details)
+    total_payout = total_nhay * payout_per_hit
+    profit_loss = total_payout - total_stake
+
     hit_rate = (
         hit_days / tested_days * 100
         if tested_days
+        else 0
+    )
+
+    roi = (
+        profit_loss / total_stake * 100
+        if total_stake
         else 0
     )
 
@@ -616,6 +672,12 @@ def backtest(history, test_days=30, top_n=5):
         "tested_days": tested_days,
         "hits": hit_days,
         "hit_rate": hit_rate,
+        "total_bets": total_bets,
+        "total_stake": total_stake,
+        "total_nhay": total_nhay,
+        "total_payout": total_payout,
+        "profit_loss": profit_loss,
+        "roi": roi,
         "details": details
     }
 
@@ -645,6 +707,26 @@ with st.sidebar:
     )
 
     st.divider()
+
+    st.subheader("💰 Cài đặt tính lãi/lỗ")
+
+    cost_per_point = st.number_input(
+        "Tiền cược mỗi số (đồng)",
+        min_value=0,
+        value=23000,
+        step=1000
+    )
+
+    payout_per_hit = st.number_input(
+        "Tiền trả mỗi nháy (đồng)",
+        min_value=0,
+        value=80000,
+        step=1000
+    )
+
+    backtest_top_n = 5
+
+    st.caption("Backtest lãi/lỗ: cố định 5 số/ngày theo lựa chọn của bạn.")
 
     if st.button(
         "🔄 Làm mới dữ liệu",
@@ -941,10 +1023,17 @@ st.write(
 backtest_result = backtest(
     history,
     test_days=min(30, max(1, len(history) - 30)),
-    top_n=5
+    top_n=backtest_top_n,
+    cost_per_point=cost_per_point,
+    payout_per_hit=payout_per_hit
 )
 
 if backtest_result["tested_days"] > 0:
+
+    st.info(
+        f"💡 Backtest đang giả định đánh {backtest_top_n} số/ngày | "
+        f"{cost_per_point:,.0f}đ/số | {payout_per_hit:,.0f}đ/nháy."
+    )
 
     c1, c2, c3 = st.columns(3)
 
@@ -966,6 +1055,43 @@ if backtest_result["tested_days"] > 0:
             f"{backtest_result['hit_rate']:.1f}%"
         )
 
+    m1, m2, m3 = st.columns(3)
+
+    with m1:
+        st.metric(
+            "🎯 Tổng số nháy",
+            f"{backtest_result['total_nhay']:,}"
+        )
+
+    with m2:
+        st.metric(
+            "💰 Tổng tiền cược",
+            f"{backtest_result['total_stake']:,} đ"
+        )
+
+    with m3:
+        st.metric(
+            "💵 Tổng tiền trả",
+            f"{backtest_result['total_payout']:,} đ"
+        )
+
+    profit = backtest_result["profit_loss"]
+    profit_label = "🟢 Lãi" if profit >= 0 else "🔴 Lỗ"
+
+    p1, p2 = st.columns(2)
+
+    with p1:
+        st.metric(
+            profit_label,
+            f"{profit:+,} đ"
+        )
+
+    with p2:
+        st.metric(
+            "📊 ROI",
+            f"{backtest_result['roi']:+.2f}%"
+        )
+
     detail_df = pd.DataFrame(
         backtest_result["details"]
     )
@@ -974,6 +1100,13 @@ if backtest_result["tested_days"] > 0:
         detail_df,
         use_container_width=True,
         hide_index=True
+    )
+
+    st.caption(
+        "⚠️ 'Số lượng trúng' là số dự đoán khác nhau có xuất hiện. "
+        "'Nháy' là tổng số lần xuất hiện thực tế của các số dự đoán trong ngày, "
+        "nên dùng 'Nháy' để tính tiền trả. Đây chỉ là phép tính lịch sử, "
+        "không phải bảo đảm kết quả tương lai."
     )
 
 else:
